@@ -21,8 +21,10 @@
 #define GPT_PRIMARY_PARTITION_TABLE_LBA 1
 
 #define GPT_ENTRY_NUMBERS 32
+#define GPT_ENTRY_SIZE 128
+#define GPT_ARRAY_SECTORS ((GPT_ENTRY_NUMBERS * GPT_ENTRY_SIZE) / SECTOR_SIZE)
 #define GPT_RESERVED_SECTORS                                                   \
-  (GPT_PRIMARY_PARTITION_TABLE_LBA + GPT_ENTRY_NUMBERS)
+  (GPT_PRIMARY_PARTITION_TABLE_LBA + GPT_ARRAY_SECTORS)
 
 #define UUID_SIZE 16
 
@@ -116,7 +118,8 @@ int main(int argc, char *argv[]) {
   uint64_t total_sectors = bytes / SECTOR_SIZE;
   uint64_t lastlba = total_sectors - 1 - PS5_M2_PART44_LBA_OFFSET;
   uint64_t first_usable_lba = PS5_M2_MBR_LBA + GPT_RESERVED_SECTORS + 1;
-  uint64_t last_usable_lba = lastlba - GPT_RESERVED_SECTORS;
+  uint64_t last_usable_lba = lastlba - GPT_ARRAY_SECTORS - 1;
+  uint64_t size_in_lba = lastlba - PS5_M2_MBR_LBA;
 
   printf("Disk Info:\n");
   printf("  Total Bytes: %" PRIu64 "\n", bytes);
@@ -132,19 +135,20 @@ int main(int argc, char *argv[]) {
   mbr.partition_record[0].os_type = EFI_PMBR_OSTYPE_EFI_GPT;
   mbr.partition_record[0].starting_lba =
       PS5_M2_MBR_LBA + GPT_PRIMARY_PARTITION_TABLE_LBA;
-  mbr.partition_record[0].size_in_lba = lastlba - PS5_M2_MBR_LBA;
+  mbr.partition_record[0].size_in_lba =
+      (size_in_lba > 0xffffffff) ? 0xffffffff : (uint32_t)size_in_lba;
 
   printf("\nMBR Info:\n");
   printf("  MBR Start LBA: %u\n", mbr.partition_record[0].starting_lba);
   printf("  MBR Size (LBA): %u\n", mbr.partition_record[0].size_in_lba);
 
-  uint8_t entries[SECTOR_SIZE * GPT_ENTRY_NUMBERS] = {};
+  uint8_t entries[SECTOR_SIZE * GPT_ARRAY_SECTORS] = {};
   gpt_entry *pte = (gpt_entry *)entries;
 
   pte[0].partition_type_guid = PARTITION_LINUX_FILE_SYSTEM_DATA_GUID;
   memset(pte[0].unique_partition_guid.b, 0x41, UUID_SIZE);
-  pte[0].starting_lba = first_usable_lba;
-  pte[0].ending_lba = last_usable_lba;
+  pte[0].starting_lba = ((first_usable_lba + 2047) / 2048) * 2048;
+  pte[0].ending_lba = ((last_usable_lba + 1) / 2048) * 2048 - 1;
 
   uint8_t gpt_sector[SECTOR_SIZE] = {};
   gpt_header *gpt = (gpt_header *)gpt_sector;
@@ -157,8 +161,8 @@ int main(int argc, char *argv[]) {
   gpt->last_usable_lba = last_usable_lba;
   gpt->partition_entry_lba =
       PS5_M2_MBR_LBA + GPT_PRIMARY_PARTITION_TABLE_LBA + 1;
-  gpt->num_partition_entries = sizeof(entries) / sizeof(gpt_entry);
-  gpt->sizeof_partition_entry = sizeof(gpt_entry);
+  gpt->num_partition_entries = GPT_ENTRY_NUMBERS;
+  gpt->sizeof_partition_entry = GPT_ENTRY_SIZE;
   memset(gpt->disk_guid.b, 0x42, UUID_SIZE);
 
   gpt->partition_entry_array_crc32 = crc32(0L, entries, sizeof(entries));
@@ -196,7 +200,7 @@ int main(int argc, char *argv[]) {
 
   gpt->my_lba = lastlba;
   gpt->alternate_lba = PS5_M2_MBR_LBA + GPT_PRIMARY_PARTITION_TABLE_LBA;
-  gpt->partition_entry_lba = lastlba - GPT_ENTRY_NUMBERS;
+  gpt->partition_entry_lba = lastlba - GPT_ARRAY_SECTORS;
   gpt->header_crc32 = 0;
   gpt->header_crc32 = crc32(0L, (uint8_t *)gpt, gpt->header_size);
 
@@ -205,7 +209,7 @@ int main(int argc, char *argv[]) {
   printf("  Partition Entry LBA: %" PRIu64 "\n", gpt->partition_entry_lba);
 
   // Write alternate gpt.
-  if (lseek(fd, (off_t)(lastlba - GPT_ENTRY_NUMBERS) * SECTOR_SIZE, SEEK_SET) ==
+  if (lseek(fd, (off_t)(lastlba - GPT_ARRAY_SECTORS) * SECTOR_SIZE, SEEK_SET) ==
       (off_t)-1) {
     perror("lseek");
     close(fd);
@@ -223,6 +227,12 @@ int main(int argc, char *argv[]) {
   }
   if (write(fd, gpt_sector, SECTOR_SIZE) != SECTOR_SIZE) {
     perror("write");
+    close(fd);
+    return EXIT_FAILURE;
+  }
+
+  if (fsync(fd) == -1) {
+    perror("fsync");
     close(fd);
     return EXIT_FAILURE;
   }
